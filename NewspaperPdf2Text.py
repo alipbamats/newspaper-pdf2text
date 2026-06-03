@@ -1,4 +1,6 @@
 import sys
+from importlib.resources import read_text
+
 from PySide6.QtWidgets import (QApplication,
                                QMainWindow,
                                QSplitter,
@@ -37,6 +39,7 @@ class NewspaperPdf2Text(QMainWindow):
     image_area: QLabel = None
     tree_view: QTreeView = None
     pdf_pages: Dict[int,PdfPage] = None
+    active_pdf_page: PdfPage = None
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Newspaper PDF to text")
@@ -78,6 +81,8 @@ class NewspaperPdf2Text(QMainWindow):
 
         self.images_scroll_area = QScrollArea()
         self.image_area = QLabel()
+        self.image_area.installEventFilter(self)
+        self.image_area.setMouseTracking(True)
 
         self.tree_view = QTreeView()
 
@@ -103,7 +108,7 @@ class NewspaperPdf2Text(QMainWindow):
 
         # 3. Create a layout for the container widget
         layout = QVBoxLayout(container_widget)
-        layout.setSpacing(15)  # Add padding between images
+        layout.setSpacing(25)  # Add padding between images
 
         # 4. Generate and add many images to the layout
         for page_num, page in self.pdf_pages.items():
@@ -116,7 +121,6 @@ class NewspaperPdf2Text(QMainWindow):
             image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(image_label)
         self.images_scroll_area.setWidget(container_widget)
-
 
     def open_file(self):
         # pdf_file_path, _ = QFileDialog.getOpenFileName(
@@ -136,12 +140,14 @@ class NewspaperPdf2Text(QMainWindow):
         self.pdf_pages: Dict[int, PdfPage] = {}
         for page_num, page in enumerate(pymupdf_doc):
             pdf_page=PdfPage()
-            pix = page.get_pixmap(dpi=60)
+            pdf_page.dpi = 90
+            pix = page.get_pixmap(dpi=pdf_page.dpi)
             pix_small = page.get_pixmap(dpi=10)
-            pdf_page.png_binary=pix.tobytes("png")
-            pdf_page.png_binary_small = self.draw_number_on_image(page_num+1, pix_small.tobytes("png"))
-            pdf_page.dpi = 60
             pdf_page.fitz_page = fitz_doc[page_num].get_text("rawdict")
+            width=int(pdf_page.fitz_page["width"])
+            height=int(pdf_page.fitz_page["height"])
+            pdf_page.png_binary=self.resize_image(png_bytes=pix.tobytes("png"),width=width,height=height)
+            pdf_page.png_binary_small = self.draw_number_on_image(page_num+1, pix_small.tobytes("png"))
             self.pdf_pages[page_num] = pdf_page
 
         pymupdf_doc.close()
@@ -162,21 +168,58 @@ class NewspaperPdf2Text(QMainWindow):
         image.save(img_byte_arr, format="PNG")
         return img_byte_arr.getvalue()
 
+    def resize_image(self, png_bytes: bytes, width: int, height: int):
+        image_stream = io.BytesIO(png_bytes)
+        image = Image.open(image_stream)
+        resized_image=image.resize((width,height))
+        img_byte_arr = io.BytesIO()
+        resized_image.save(img_byte_arr, format="PNG")
+        return img_byte_arr.getvalue()
+
     def eventFilter(self, obj, event):
+        print("sfdsdf")
         if event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
                 result, pdf_page = self.is_clicked_on_scroll_area(obj)
                 if result:
-                    self.set_image_area(pdf_page)
+                    self.active_pdf_page=pdf_page
+                    self.draw_image_area()
                 return True  # Mark event as handled
+
+        if event.type() == QEvent.Type.MouseMove and obj == self.image_area:
+            print(event.x(),event.y())
+            self.draw_image_area(x=event.x(),y=event.y())
         return super().eventFilter(obj, event)
 
-    def set_image_area(self, pdf_page: PdfPage):
+    def draw_image_area(self, x: int=None, y: int=None):
+        if not self.active_pdf_page:
+            return
         pixmap = QPixmap()
-        pixmap.loadFromData(pdf_page.png_binary)
+        image_stream = io.BytesIO(self.active_pdf_page.png_binary)
+        image = Image.open(image_stream)
+        draw = ImageDraw.Draw(image)
+        for block in self.active_pdf_page.fitz_page["blocks"]:
+            bbox=block["bbox"]
+            coordinates = [bbox[0], bbox[1], bbox[2], bbox[3]]
+            draw.rectangle(coordinates, outline="green", width=1)
+
+
+        if x is not None and y is not None:
+            for block in self.active_pdf_page.fitz_page["blocks"]:
+                bbox = block["bbox"]
+                if x>bbox[0] and y>bbox[1] and x<bbox[2] and y<bbox[3]:
+                    coordinates = [bbox[0]+5, bbox[1]+5, bbox[2]-5, bbox[3]-5]
+                    draw.rectangle(coordinates, outline="red", width=2)
+
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format="PNG")
+
+        pixmap.loadFromData(img_byte_arr.getvalue())
         self.image_area.setPixmap(pixmap)
         self.image_area.setScaledContents(False)
         self.image_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+
 
     def is_clicked_on_scroll_area(self, obj) -> tuple [bool, PdfPage]:
         for page_num, page in self.pdf_pages.items():
