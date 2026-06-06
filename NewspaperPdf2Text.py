@@ -1,6 +1,7 @@
 import sys
 from importlib.resources import read_text
 
+from PIL.PngImagePlugin import PngImageFile
 from PySide6.QtWidgets import (QApplication,
                                QMainWindow,
                                QSplitter,
@@ -12,11 +13,11 @@ from PySide6.QtWidgets import (QApplication,
                                QLabel,
                                QTreeView)
 from PySide6.QtGui import QPixmap, QColor, QPainter
-from PySide6.QtCore import Qt, QObject, QEvent
+from PySide6.QtCore import Qt, QObject, QEvent, QAbstractItemModel
 from PySide6.QtGui import QAction, QKeySequence, QStandardItemModel, QStandardItem
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QFileDialog, QMenu, QSizePolicy
 
-from typing import Dict
+from typing import Dict, Any, List
 
 import fitz  # PyMuPDF
 import io
@@ -27,21 +28,83 @@ class PageStruct:
     pass
 
 class PdfPage:
+    image_height: int = None
+    image_width: int = None
     dpi: int = None
     png_binary: bytes = None
+    image_file: PngImageFile = None
+    png_binary_rect: bytes = None
+    image_file_rect: PngImageFile = None
+    image_file_selected: PngImageFile = None
     png_binary_small: bytes = None
     fitz_page: None
     image_label: QLabel = None
+
+class NewsTree:
+    q_standart_item: QStandardItem = None
+    text: str = None
+    number: int = None
+    png_image_bytes: bytes = None
+    type: str = None
+    items: List[Any] = None
+    x1: int = None
+    y1: int = None
+    x2: int = None
+    y2: int = None
+    pdf_page: PdfPage = None
+
+    def __init__(self):
+        self.items: List[Any] = []
+    def add_item(self, news_tree_element: Any, q_standart_item: QStandardItem):
+
+        if self.q_standart_item == q_standart_item:
+            if news_tree_element.type=="text":
+                news_tree_element.number = len(self.items)+1
+                print_line="Text №{}: \"{}...\"".format(str(news_tree_element.number),news_tree_element.text[0:25])
+                news_tree_element.q_standart_item = QStandardItem(print_line)
+                q_standart_item.appendRow(news_tree_element.q_standart_item)
+            if news_tree_element.type == "title":
+                print_line = "Title: \"{}\"...".format(news_tree_element.text[0:25])
+                news_tree_element.q_standart_item = QStandardItem(print_line)
+                q_standart_item.appendRow(news_tree_element.q_standart_item)
+            self.items.append(news_tree_element)
+            return True
+
+        for tree_item in self.items:
+            if tree_item.add_item( news_tree_element, q_standart_item):
+                return True
+        return False
+
+    def print_tree(self,filler:str=""):
+        print(filler,">",self.type)
+        print(filler,">",self.text.replace('\n', '') if type(self.text)==str else None)
+        for item in self.items:
+            item.print_tree(filler+"--")
+
+    def get_items_by_page(self, news_tree_elements: List[Any], pdf_page: PdfPage):
+        if self.pdf_page == pdf_page:
+            news_tree_elements.append(self)
+        for news_tree_element in self.items:
+            if news_tree_element.pdf_page == pdf_page:
+                news_tree_elements.append(news_tree_element)
+            news_tree_element.get_items_by_page(news_tree_elements=news_tree_elements,pdf_page=pdf_page)
 
 class NewspaperPdf2Text(QMainWindow):
     splitter: QSplitter = None
     images_scroll_area: QScrollArea = None
     image_area: QLabel = None
     tree_view: QTreeView = None
+    tree_model: QAbstractItemModel = None
+    active_tree_model: QAbstractItemModel = None
     pdf_pages: Dict[int,PdfPage] = None
     active_pdf_page: PdfPage = None
+    active_block: Dict[str, Any] = None
+    news_tree: NewsTree = None
+
     def __init__(self):
         super().__init__()
+        self.new_posts={}
+
         self.setWindowTitle("Newspaper PDF to text")
         self.resize(400, 300)
         self.init_menu()
@@ -80,16 +143,39 @@ class NewspaperPdf2Text(QMainWindow):
         self.splitter = QSplitter(Qt.Horizontal)
 
         self.images_scroll_area = QScrollArea()
+        self.images_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.images_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # scrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.images_scroll_area.setWidgetResizable(True)
+        self.images_scroll_area.setFixedWidth(200)
+
+        working_image_scroll_area = QScrollArea()
         self.image_area = QLabel()
         self.image_area.installEventFilter(self)
         self.image_area.setMouseTracking(True)
+        self.image_area.setScaledContents(True)
+        # self.image_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # self.image_area.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        working_image_scroll_area.setWidget(self.image_area)
 
         self.tree_view = QTreeView()
+        self.tree_view.setMaximumWidth(400)
+        self.tree_view.clicked.connect(self.on_click_tree_view)
+
+
+        self.tree_model = QStandardItemModel()
+        self.tree_model.setHorizontalHeaderLabels(["News posts"])
+        root_item = QStandardItem("Корень")
+        self.tree_model.appendRow(root_item)
+        self.news_tree=NewsTree()
+        self.news_tree.q_standart_item=root_item
+        self.news_tree.type="root"
+        self.tree_view.setModel(self.tree_model)
 
         # 4. Add both widgets to the splitter
         self.splitter.addWidget(self.tree_view)
         self.splitter.addWidget(self.images_scroll_area)
-        self.splitter.addWidget(self.image_area)
+        self.splitter.addWidget(working_image_scroll_area)
 
         # Set initial sizes (50% width for each side)
         self.splitter.setSizes([400, 400, 400])
@@ -108,7 +194,7 @@ class NewspaperPdf2Text(QMainWindow):
 
         # 3. Create a layout for the container widget
         layout = QVBoxLayout(container_widget)
-        layout.setSpacing(25)  # Add padding between images
+        layout.setSpacing(5)  # Add padding between images
 
         # 4. Generate and add many images to the layout
         for page_num, page in self.pdf_pages.items():
@@ -121,6 +207,9 @@ class NewspaperPdf2Text(QMainWindow):
             image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(image_label)
         self.images_scroll_area.setWidget(container_widget)
+
+    def wheelEvent(self, event):
+        pass
 
     def open_file(self):
         # pdf_file_path, _ = QFileDialog.getOpenFileName(
@@ -140,13 +229,16 @@ class NewspaperPdf2Text(QMainWindow):
         self.pdf_pages: Dict[int, PdfPage] = {}
         for page_num, page in enumerate(pymupdf_doc):
             pdf_page=PdfPage()
-            pdf_page.dpi = 90
+            pdf_page.dpi = 180
             pix = page.get_pixmap(dpi=pdf_page.dpi)
             pix_small = page.get_pixmap(dpi=10)
             pdf_page.fitz_page = fitz_doc[page_num].get_text("rawdict")
-            width=int(pdf_page.fitz_page["width"])
-            height=int(pdf_page.fitz_page["height"])
-            pdf_page.png_binary=self.resize_image(png_bytes=pix.tobytes("png"),width=width,height=height)
+            pdf_page.image_width=int(pdf_page.fitz_page["width"])
+            pdf_page.image_height=int(pdf_page.fitz_page["height"])
+            png_binary = self.resize_image(png_bytes=pix.tobytes("png"), width=pdf_page.image_width,
+                                           height=pdf_page.image_height)
+            image_stream = io.BytesIO(png_binary)
+            pdf_page.image_file = Image.open(image_stream).convert("RGBA")
             pdf_page.png_binary_small = self.draw_number_on_image(page_num+1, pix_small.tobytes("png"))
             self.pdf_pages[page_num] = pdf_page
 
@@ -177,49 +269,161 @@ class NewspaperPdf2Text(QMainWindow):
         return img_byte_arr.getvalue()
 
     def eventFilter(self, obj, event):
-        print("sfdsdf")
         if event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.LeftButton:
                 result, pdf_page = self.is_clicked_on_scroll_area(obj)
                 if result:
                     self.active_pdf_page=pdf_page
-                    self.draw_image_area()
+                    self.set_image_area()
                 return True  # Mark event as handled
 
         if event.type() == QEvent.Type.MouseMove and obj == self.image_area:
             print(event.x(),event.y())
-            self.draw_image_area(x=event.x(),y=event.y())
+            self.highlight_image_area_rects(x=event.x(),y=event.y())
+
+        # if event.type() == QEvent.Wheel and isinstance(obj, QLabel) and obj==self.image_area:
+        #     print("Scroll Area")
+        #     delta = int(0.6*event.angleDelta().y())
+        #     width = self.image_area.width()+delta
+        #     height = self.image_area.height()+delta
+        #     pixmap=self.image_area.pixmap().scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio,
+        #                                    Qt.TransformationMode.SmoothTransformation)
+        #     self.image_area.setPixmap(pixmap)
+
         return super().eventFilter(obj, event)
 
-    def draw_image_area(self, x: int=None, y: int=None):
+    def highlight_image_area_rects(self,x: int, y: int):
         if not self.active_pdf_page:
             return
-        pixmap = QPixmap()
-        image_stream = io.BytesIO(self.active_pdf_page.png_binary)
-        image = Image.open(image_stream)
-        draw = ImageDraw.Draw(image)
+        if x is not None and y is not None:
+            width = self.active_pdf_page.image_width
+            height = self.active_pdf_page.image_height
+            highlight_image = Image.new(mode="RGBA",
+                                        size=(width,height))
+            draw = ImageDraw.Draw(highlight_image)
+            for block in self.active_pdf_page.fitz_page["blocks"]:
+                bbox = block["bbox"]
+                if x>bbox[0] and y>bbox[1] and x<bbox[2] and y<bbox[3]:
+                    coordinates = [bbox[0]+1, bbox[1]+1, bbox[2]-1, bbox[3]-1]
+                    draw.rectangle(coordinates, outline="red", width=2)
+                    self.active_block=block
+
+            result_image = Image.alpha_composite(self.active_pdf_page.image_file_rect, highlight_image)
+            img_byte_arr = io.BytesIO()
+            result_image.save(img_byte_arr, format="PNG")
+            pixmap = QPixmap()
+            pixmap.loadFromData(img_byte_arr.getvalue())
+            self.image_area.setPixmap(pixmap)
+            self.image_area.setScaledContents(False)
+            self.image_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_image_area(self):
+        if not self.active_pdf_page:
+            return
+        width=self.active_pdf_page.image_width
+        height=self.active_pdf_page.image_height
+        image_file_rect = Image.new(mode="RGBA", size=(width, height))
+        draw = ImageDraw.Draw(image_file_rect)
         for block in self.active_pdf_page.fitz_page["blocks"]:
             bbox=block["bbox"]
             coordinates = [bbox[0], bbox[1], bbox[2], bbox[3]]
             draw.rectangle(coordinates, outline="green", width=1)
 
+        news_tree_elements: List[Any] = []
+        self.news_tree.get_items_by_page(news_tree_elements=news_tree_elements, pdf_page=self.active_pdf_page)
+        for news_tree_element in news_tree_elements:
+            coordinates = [news_tree_element.x1 - 2, news_tree_element.y1 - 2, news_tree_element.x2 + 2,
+                           news_tree_element.y2 + 2]
+            if news_tree_element.type=="title":
+                draw.rectangle(coordinates, outline="yellow", width=2, fill=(0, 0, 255, 128))
+            elif news_tree_element.type=="text":
+                font = ImageFont.load_default(size=20)
+                position = (news_tree_element.x1, news_tree_element.y1)
+                text_color = (0, 0, 0)
+                draw.rectangle(coordinates, outline="blue", width=2, fill=(0, 0, 120, 128))
+                draw.text(position, str(news_tree_element.number), fill=text_color, font=font)
 
-        if x is not None and y is not None:
-            for block in self.active_pdf_page.fitz_page["blocks"]:
-                bbox = block["bbox"]
-                if x>bbox[0] and y>bbox[1] and x<bbox[2] and y<bbox[3]:
-                    coordinates = [bbox[0]+5, bbox[1]+5, bbox[2]-5, bbox[3]-5]
-                    draw.rectangle(coordinates, outline="red", width=2)
-
+        self.active_pdf_page.image_file_rect = Image.alpha_composite(self.active_pdf_page.image_file, image_file_rect)
         img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format="PNG")
-
+        self.active_pdf_page.image_file_rect.save(img_byte_arr, format="PNG")
+        pixmap = QPixmap()
         pixmap.loadFromData(img_byte_arr.getvalue())
         self.image_area.setPixmap(pixmap)
+        self.image_area.resize(pixmap.size())
         self.image_area.setScaledContents(False)
-        self.image_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        #self.image_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+    def contextMenuEvent(self, event):
+        # Создаем объект меню
+        context_menu = QMenu(self)
 
+        # Добавляем действия (пункты меню)
+        action_new_post = QAction("New news post", self)
+        action_new_post_item = QAction("Add news post item", self)
+
+        context_menu.addAction(action_new_post)
+        context_menu.addAction(action_new_post_item)
+
+        # Привязываем логику к действиям
+        action_new_post.triggered.connect(self.q_tree_view_create_new_post)
+
+        action_new_post_item.triggered.connect(self.q_tree_view_create_new_post_item)
+
+        # Показываем меню там, где был курсор
+        context_menu.exec(event.globalPos())
+
+    def on_click_tree_view(self, index):
+        self.active_tree_model = self.tree_model.itemFromIndex(index)
+
+    def q_tree_view_create(self, type: str):
+        print("q_tree_view_new_post")
+        if not self.active_block:
+            return
+        if not self.active_tree_model:
+            return
+        post_name = self.get_text_from_pdf_block(self.active_block)
+        #q_standard_item = QStandardItem(post_name[0:25].replace("\n", " -- ") + "...")
+        news_tree_item = NewsTree()
+        #news_tree_item.q_standart_item = q_standard_item
+        news_tree_item.type = type
+        news_tree_item.text = post_name[0:25].replace("\n", " -- ")
+        if "bbox" in self.active_block:
+            bbox = self.active_block["bbox"]
+            news_tree_item.x1=int(bbox[0])
+            news_tree_item.y1=int(bbox[1])
+            news_tree_item.x2=int(bbox[2])
+            news_tree_item.y2=int(bbox[3])
+        news_tree_item.pdf_page = self.active_pdf_page
+        self.news_tree.add_item(news_tree_element=news_tree_item, q_standart_item=self.active_tree_model)
+        self.news_tree.print_tree()
+        #self.active_tree_model.appendRow(q_standard_item)
+
+        self.set_image_area();
+
+    def q_tree_view_create_new_post(self):
+        self.q_tree_view_create("title")
+
+    def q_tree_view_create_new_post_item(self):
+        self.q_tree_view_create("text")
+
+    def get_text_from_pdf_block(self,block:Dict[str,Any]) -> str:
+        if type(block) is not dict:
+            return ""
+        if not "lines" in block:
+            return ""
+        text_list = []
+        for line in block["lines"]:
+            if "spans" not in line:
+                continue
+            for span in line["spans"]:
+                if "chars" not in span:
+                    continue
+                for char in span["chars"]:
+                    if "c" not in char:
+                        continue
+                    text_list.append(char["c"])
+            text_list.append("\n")
+        return "".join(text_list)
 
     def is_clicked_on_scroll_area(self, obj) -> tuple [bool, PdfPage]:
         for page_num, page in self.pdf_pages.items():
